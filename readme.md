@@ -4,7 +4,7 @@
 
 # Opened ports
 
-`ps -eo pid,args | grep aeron | cut -d' ' -f3 | xargs -I _ lsof -Pan -p _ -i`
+`ps -eo pid,args | grep aeron | column -t | cut -d' ' -f1 | xargs -I _ lsof -Pan -p _ -i`
 
 On the NAME column: The local host name or IP number is followed by a colon (':'), the port, ''->'', and the two-part remote address
 
