@@ -1,13 +1,21 @@
 package pom
 
+import generated.MessageHeaderDecoder
+import generated.MessageHeaderEncoder
+import generated.RpcConnectRequestDecoder
+import generated.RpcConnectRequestEncoder
 import io.aeron.Aeron
 import io.aeron.CommonContext
+import io.aeron.Publication
 import io.aeron.driver.MediaDriver
+import io.aeron.driver.SendChannelEndpointSupplier
 import io.aeron.driver.ThreadingMode
 import io.aeron.logbuffer.FragmentHandler
 import org.agrona.CloseHelper
 import org.agrona.ExpandableDirectByteBuffer
+import org.agrona.MutableDirectBuffer
 import org.agrona.concurrent.*
+import java.util.Optional
 
 fun main(args: Array<String>) {
   val enumArgs: List<Args> = args.mapNotNull { arg ->
@@ -19,55 +27,97 @@ fun main(args: Array<String>) {
 }
 
 class AeronTest(val args: List<Args>) {
-  val idleStrategy: IdleStrategy = SleepingMillisIdleStrategy(100)
+  val idleStrategy: IdleStrategy = SleepingMillisIdleStrategy(800)
   val barrier = ShutdownSignalBarrier()
+
+
+  private fun sendChannelEndpointSupplier(): SendChannelEndpointSupplier {
+//    UdpChannel udpChannel, AtomicCounter statusIndicator, MediaDriver.Context context)
+    return sendChannelEndpointSupplier()
+  }
+
   val mediaDriverCtx = MediaDriver.Context()
     .aeronDirectoryName(CommonContext.getAeronDirectoryName() + "-${System.currentTimeMillis()}")
     .dirDeleteOnStart(true)
     .dirDeleteOnShutdown(true)
     .threadingMode(ThreadingMode.SHARED)
+
+  val originalSender = mediaDriverCtx.sendChannelEndpointSupplier()
+
   val mediaDriver = MediaDriver.launchEmbedded(mediaDriverCtx)
   val aeronCtx = Aeron.Context().aeronDirectoryName(mediaDriver.aeronDirectoryName())
   val aeron = Aeron.connect(aeronCtx)
+  val headerDec = MessageHeaderDecoder()
+  val headerEnc = MessageHeaderEncoder()
+  val connectReqDec = RpcConnectRequestDecoder()
+  val connectReqEnc = RpcConnectRequestEncoder()
 
   fun start() {
     args.forEach { arg ->
       when (arg) {
-        Args.PUB      -> pub("aeron:udp?endpoint=127.0.0.1:33506")
-        Args.SUB      -> sub("aeron:udp?endpoint=127.0.0.1:0")
-        Args.SUB_ALL  -> sub("aeron:udp?endpoint=0.0.0.0:0")
+        Args.PUB              -> waitNClose(listOf(pub("aeron:udp?endpoint=192.168.1.66:54349")))
+        Args.SUB_23456        -> waitNClose(listOf(sub("aeron:udp?endpoint=127.0.0.1:23456")))
+        Args.SUB              -> waitNClose(listOf(sub("aeron:udp?endpoint=127.0.0.1:0")))
+        Args.SUB_ALL          -> waitNClose(listOf(sub("aeron:udp?endpoint=0.0.0.0:0")))
+        Args.PING_PONG_SERVER -> {
+          val subRunner = sub("aeron:udp?endpoint=0.0.0.0:$remotePort") { buffer, offset, _, _ ->
+            println("PING_PONG_SERVER RECEIVED")
+            headerDec.wrap(buffer, offset)
+            // assuming it's the correct message
+            connectReqDec.wrap(buffer, offset + headerDec.encodedLength(), headerDec.blockLength(), headerDec.version())
+            pub("aeron:udp?endpoint=${connectReqDec.returnConnectUri()}")
+          }
+          waitNClose(listOf(subRunner))
+        }
+        Args.PING_PONG_CLIENT -> {
+          val subRunner = sub("aeron:udp?endpoint=0.0.0.0:$remotePort")
+          val pubRunner = pub("aeron:udp?endpoint=192.168.1.66:$remotePort") {
+            println("Trying to send a payload to 192.168.1.66:$remotePort")
+            val buffer = ExpandableDirectByteBuffer(512)
+            connectReqEnc.wrapAndApplyHeader(buffer, 0, headerEnc).returnConnectStream(streamId).returnConnectUri("192.168.1.70:$remotePort")
+            buffer
+          }
+          waitNClose(listOf(subRunner, pubRunner))
+        }
       }
     }
   }
 
-  fun pub(pubStr: String) {
+  var openedAgent: Optional<Agent> = Optional.empty()
+  fun pub(pubStr: String, payload: () -> MutableDirectBuffer = { ExpandableDirectByteBuffer(512) }): AgentRunner {
     println("Starting pub")
-    val pubAgent = object : Agent {
-      val pub = aeron.addExclusivePublication(pubStr, streamId)
-      init {
-        println("Created pub $pub")
+
+    if (openedAgent.isEmpty) {
+      val pubAgent = object : Agent {
+        val pub = aeron.addExclusivePublication(pubStr, streamId)
+
+        init {
+          println("Created pub $pub")
+        }
+
+        override fun doWork(): Int {
+          if (!pub.isConnected)
+            println("not connected: $pub")
+          else
+            pub.offer(payload.invoke())
+          return 0
+        }
+
+        override fun roleName(): String {
+          return "sendAgent"
+        }
       }
-      override fun doWork(): Int {
-        if (!pub.isConnected)
-          println("not connected: $pub")
-        else
-          pub.offer(ExpandableDirectByteBuffer(512))
-        return 0
-      }
-      override fun roleName(): String {
-        return "sendAgent"
-      }
+      openedAgent = Optional.of(pubAgent)
     }
-    val pubAgentRunner = AgentRunner(idleStrategy, {obj: Throwable -> obj.printStackTrace() }, null, pubAgent)
+    val pubAgentRunner = AgentRunner(idleStrategy, {obj: Throwable -> obj.printStackTrace() }, null, openedAgent.get())
     AgentRunner.startOnThread(pubAgentRunner)
-    waitNClose(listOf(pubAgentRunner))
+    return pubAgentRunner
   }
 
-  fun sub(subStr: String) {
+  fun sub(subStr: String, handler: FragmentHandler = FragmentHandler { buffer, offset, length, header -> println("Received") }): AgentRunner {
     println("Starting sub")
     val subAgent = object : Agent {
       val sub = aeron.addSubscription(subStr, streamId)
-      val handler = FragmentHandler { buffer, offset, length, header -> println("Received") }
       init {
         println("Waiting, sub: $sub")
       }
@@ -81,9 +131,8 @@ class AeronTest(val args: List<Args>) {
     val subAgentRunner = AgentRunner(idleStrategy, { obj: Throwable -> obj.printStackTrace() }, null, subAgent)
     AgentRunner.startOnThread(subAgentRunner)
 
-
     //Await shutdown signal
-    waitNClose(listOf(subAgentRunner))
+    return subAgentRunner
   }
 
   private fun waitNClose(runners: List<AgentRunner> = listOf()) {
@@ -95,5 +144,6 @@ class AeronTest(val args: List<Args>) {
 
   companion object {
     val streamId = 0
+    val remotePort = 33506
   }
 }
